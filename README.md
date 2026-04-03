@@ -43,6 +43,7 @@ bay release
 For local development before install:
 
 ```bash
+bun install
 bun run ./index.ts acquire
 bun run ./index.ts info --all
 ```
@@ -81,6 +82,7 @@ nix run . -- acquire
 ## Development
 
 ```bash
+bun install
 bun test
 bun run build
 ```

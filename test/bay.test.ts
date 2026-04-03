@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { promises as fs } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { promises as fs } from "node:fs";
 
 const repoDir = path.resolve(import.meta.dir, "..");
 const cliPath = path.join(repoDir, "index.ts");
@@ -99,8 +99,27 @@ describe("bay cli", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("PORT=$(bay acquire)");
-    expect(result.stdout).toContain("bay acquire -n 5");
+    expect(result.stdout).toContain("readarray -t PORTS");
+    expect(result.stdout).toContain("acquire [options] [ports...]");
     expect(result.stderr).toBe("");
+  });
+
+  test("acquire help is generated and includes notes", async () => {
+    const sandbox = await makeSandbox();
+    const result = await runBay(["acquire", "--help"], sandbox);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Usage: bay acquire [options] [ports...]");
+    expect(result.stdout).toContain("--count <count>");
+    expect(result.stdout).toContain("successful output is port numbers only");
+  });
+
+  test("version comes from package metadata", async () => {
+    const sandbox = await makeSandbox();
+    const result = await runBay(["--version"], sandbox);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("0.1.0");
   });
 
   test("acquire with no args prints a single port and info shows metadata", async () => {

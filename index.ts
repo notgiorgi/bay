@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
 
 import { promises as fs } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import net from "node:net";
+import { Command, CommanderError, InvalidArgumentError } from "commander";
+import packageJson from "./package.json" with { type: "json" };
 
 type PortRecord = {
   port: number;
@@ -29,124 +31,6 @@ class CliError extends Error {
   }
 }
 
-const HELP_TEXT = `bay
-
-Acquire, inspect, and release local TCP ports tracked by bay.
-
-Usage:
-  bay <command> [options]
-
-Commands:
-  acquire [PORT ...]     Acquire one free port, many free ports, or named ports
-  check <PORT>           Print whether a port is free right now
-  info [PORT]            Show info for one port, this directory, or all tracked ports
-  release [PORT ...]     Release named ports or all ports acquired in the current directory
-  help [command]         Show top-level or command-specific help
-
-Shell-friendly output:
-  bay acquire            Prints exactly one port number
-  bay acquire -n 5       Prints one acquired port per line
-  bay acquire 3000 3001  Prints acquired ports, one per line
-  bay release 3000 3001  Prints released ports, one per line
-  bay check 3000         Prints "free" or "in-use"
-
-Examples:
-  PORT=$(bay acquire)
-  readarray -t PORTS < <(bay acquire -n 3)
-  bay acquire 3000 3001
-  bay check 3000
-  bay info 3000
-  bay info
-  bay info --all
-  bay release
-  bay release 3000 3001
-
-State directories:
-  Linux:
-    config: $XDG_CONFIG_HOME/bay or ~/.config/bay
-    state:  $XDG_STATE_HOME/bay or ~/.local/state/bay
-  macOS:
-    config: ~/Library/Application Support/bay
-    state:  ~/Library/Application Support/bay/state
-
-Exit codes:
-  0  success
-  1  operational failure (for example: port is already in use or lock timeout)
-  2  usage error
-
-Run "bay help <command>" for command-specific help.
-`;
-
-const ACQUIRE_HELP = `bay acquire
-
-Acquire ports and track them in bay's state file.
-
-Usage:
-  bay acquire
-  bay acquire -n <COUNT>
-  bay acquire <PORT> [PORT ...]
-
-Behavior:
-  - With no arguments, acquires exactly one free port.
-  - With -n/--count, acquires COUNT free ports.
-  - With positional ports, acquires the named ports.
-  - Requests are atomic: if one requested port cannot be acquired, none are stored.
-  - Successful output is port numbers only, one per line.
-
-Examples:
-  PORT=$(bay acquire)
-  readarray -t PORTS < <(bay acquire -n 5)
-  bay acquire 3000 3001 3002
-`;
-
-const CHECK_HELP = `bay check
-
-Check whether a TCP port is currently free to bind.
-
-Usage:
-  bay check <PORT>
-
-Output:
-  free
-  in-use
-
-Exit codes:
-  0  port is free
-  1  port is in use
-  2  usage error
-`;
-
-const INFO_HELP = `bay info
-
-Show tracked metadata and current port status.
-
-Usage:
-  bay info
-  bay info --all
-  bay info <PORT>
-
-Behavior:
-  - With no arguments, shows ports acquired by bay in the current directory.
-  - With --all, shows every port tracked by bay.
-  - With a port, shows detailed metadata for that specific port.
-  - For tracked ports, bay also checks whether the port is currently free or in use.
-`;
-
-const RELEASE_HELP = `bay release
-
-Release ports tracked by bay.
-
-Usage:
-  bay release
-  bay release <PORT> [PORT ...]
-
-Behavior:
-  - With no arguments, releases every port acquired in the current directory.
-  - With positional ports, releases those exact tracked ports.
-  - Successful output is released port numbers only, one per line.
-  - Named releases are atomic: if one named port is not tracked, none are removed.
-`;
-
 function printLine(message = ""): void {
   process.stdout.write(`${message}\n`);
 }
@@ -157,25 +41,25 @@ function printError(message: string): void {
 
 function parsePort(value: string): number {
   if (!/^\d+$/.test(value)) {
-    throw new CliError(`invalid port "${value}"`, 2);
+    throw new InvalidArgumentError(`invalid port "${value}"`);
   }
 
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new CliError(`invalid port "${value}"`, 2);
+    throw new InvalidArgumentError(`invalid port "${value}"`);
   }
 
   return port;
 }
 
-function parsePositiveCount(value: string): number {
+function parseCount(value: string): number {
   if (!/^\d+$/.test(value)) {
-    throw new CliError(`invalid count "${value}"`, 2);
+    throw new InvalidArgumentError(`invalid count "${value}"`);
   }
 
   const count = Number(value);
   if (!Number.isInteger(count) || count < 1) {
-    throw new CliError(`invalid count "${value}"`, 2);
+    throw new InvalidArgumentError(`invalid count "${value}"`);
   }
 
   return count;
@@ -255,8 +139,7 @@ async function writeState(state: BayState): Promise<void> {
   await ensureStateDir();
   const { statePath } = statePaths();
   const tempPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
-  const payload = `${JSON.stringify(state, null, 2)}\n`;
-  await fs.writeFile(tempPath, payload, "utf8");
+  await fs.writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
   await fs.rename(tempPath, statePath);
 }
 
@@ -270,9 +153,6 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EPERM") {
-      return true;
-    }
     if (code === "ESRCH") {
       return false;
     }
@@ -345,13 +225,16 @@ async function canBind(options: net.ListenOptions): Promise<"free" | "in-use" | 
     server.unref();
 
     server.once("error", (error: NodeJS.ErrnoException) => {
-      const code = error.code;
-      if (code === "EADDRINUSE") {
+      if (error.code === "EADDRINUSE") {
         resolve("in-use");
         return;
       }
 
-      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL" || code === "EINVAL") {
+      if (
+        error.code === "EAFNOSUPPORT" ||
+        error.code === "EADDRNOTAVAIL" ||
+        error.code === "EINVAL"
+      ) {
         resolve("unsupported");
         return;
       }
@@ -422,7 +305,6 @@ async function allocatePorts(count: number, state: BayState): Promise<number[]> 
     if (seen.has(String(port))) {
       continue;
     }
-
     if (!(await isPortFree(port))) {
       continue;
     }
@@ -442,8 +324,15 @@ async function getCurrentDir(): Promise<string> {
   return await fs.realpath(process.cwd());
 }
 
-function formatBoolean(value: boolean): string {
-  return value ? "yes" : "no";
+function buildRecord(port: number, cwd: string): PortRecord {
+  return {
+    port,
+    cwd,
+    acquiredAt: new Date().toISOString(),
+    acquiredByPid: process.pid,
+    hostname: os.hostname(),
+    username: os.userInfo().username,
+  };
 }
 
 function pad(value: string, width: number): string {
@@ -451,10 +340,9 @@ function pad(value: string, width: number): string {
 }
 
 async function printSinglePortInfo(port: number, record: PortRecord | undefined): Promise<void> {
-  const free = await isPortFree(port);
   printLine(`Port: ${port}`);
   printLine(`Tracked by bay: ${record ? "yes" : "no"}`);
-  printLine(`Currently free: ${formatBoolean(free)}`);
+  printLine(`Currently free: ${await isPortFree(port) ? "yes" : "no"}`);
 
   if (!record) {
     return;
@@ -510,57 +398,13 @@ async function printPortTable(records: PortRecord[]): Promise<void> {
   }
 }
 
-function buildRecord(port: number, cwd: string): PortRecord {
-  return {
-    port,
-    cwd,
-    acquiredAt: new Date().toISOString(),
-    acquiredByPid: process.pid,
-    hostname: os.hostname(),
-    username: os.userInfo().username,
-  };
-}
-
-async function handleAcquire(args: string[]): Promise<number> {
-  let count: number | undefined;
-  const requestedPorts: number[] = [];
-
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-
-    if (arg === "--help" || arg === "-h") {
-      printLine(ACQUIRE_HELP);
-      return 0;
-    }
-
-    if (arg === "-n" || arg === "--count") {
-      const next = args[index + 1];
-      if (!next) {
-        throw new CliError("missing value for -n/--count", 2);
-      }
-      count = parsePositiveCount(next);
-      index += 1;
-      continue;
-    }
-
-    if (arg.startsWith("-")) {
-      throw new CliError(`unknown option "${arg}"`, 2);
-    }
-
-    requestedPorts.push(parsePort(arg));
-  }
-
-  if (count !== undefined && requestedPorts.length > 0) {
-    throw new CliError("cannot combine -n/--count with named ports", 2);
-  }
-
-  ensureUniquePorts(requestedPorts);
-
+async function acquirePorts(namedPorts: number[], count?: number): Promise<void> {
+  ensureUniquePorts(namedPorts);
   const cwd = await getCurrentDir();
+
   const acquired = await withLock(async () => {
     const state = await readState();
-    const ports =
-      requestedPorts.length > 0 ? requestedPorts : await allocatePorts(count ?? 1, state);
+    const ports = namedPorts.length > 0 ? namedPorts : await allocatePorts(count ?? 1, state);
 
     for (const port of ports) {
       if (state.ports[String(port)]) {
@@ -582,108 +426,29 @@ async function handleAcquire(args: string[]): Promise<number> {
   for (const port of acquired) {
     printLine(String(port));
   }
-
-  return 0;
 }
 
-async function handleCheck(args: string[]): Promise<number> {
-  if (args.includes("--help") || args.includes("-h")) {
-    printLine(CHECK_HELP);
-    return 0;
-  }
-
-  if (args.length !== 1) {
-    throw new CliError("check expects exactly one port", 2);
-  }
-
-  const port = parsePort(args[0]);
-  const free = await isPortFree(port);
-  printLine(free ? "free" : "in-use");
-  return free ? 0 : 1;
-}
-
-async function handleInfo(args: string[]): Promise<number> {
-  let all = false;
-  const positional: string[] = [];
-
-  for (const arg of args) {
-    if (arg === "--help" || arg === "-h") {
-      printLine(INFO_HELP);
-      return 0;
-    }
-
-    if (arg === "--all") {
-      all = true;
-      continue;
-    }
-
-    if (arg.startsWith("-")) {
-      throw new CliError(`unknown option "${arg}"`, 2);
-    }
-
-    positional.push(arg);
-  }
-
-  if (all && positional.length > 0) {
-    throw new CliError("cannot combine --all with a specific port", 2);
-  }
-
-  if (positional.length > 1) {
-    throw new CliError("info accepts at most one port", 2);
-  }
-
-  const state = await withLock(async () => await readState());
-
-  if (positional.length === 1) {
-    const port = parsePort(positional[0]);
-    await printSinglePortInfo(port, state.ports[String(port)]);
-    return 0;
-  }
-
+async function releasePorts(requestedPorts: number[]): Promise<void> {
+  ensureUniquePorts(requestedPorts);
   const cwd = await getCurrentDir();
-  const records = Object.values(state.ports)
-    .filter((record) => all || record.cwd === cwd)
-    .sort((left, right) => left.port - right.port);
 
-  await printPortTable(records);
-  return 0;
-}
-
-async function handleRelease(args: string[]): Promise<number> {
-  const requested: number[] = [];
-
-  for (const arg of args) {
-    if (arg === "--help" || arg === "-h") {
-      printLine(RELEASE_HELP);
-      return 0;
-    }
-
-    if (arg.startsWith("-")) {
-      throw new CliError(`unknown option "${arg}"`, 2);
-    }
-
-    requested.push(parsePort(arg));
-  }
-
-  ensureUniquePorts(requested);
-
-  const cwd = await getCurrentDir();
   const released = await withLock(async () => {
     const state = await readState();
 
-    let portsToRelease: number[];
-    if (requested.length > 0) {
-      for (const port of requested) {
+    const portsToRelease =
+      requestedPorts.length > 0
+        ? requestedPorts
+        : Object.values(state.ports)
+            .filter((record) => record.cwd === cwd)
+            .map((record) => record.port)
+            .sort((left, right) => left - right);
+
+    if (requestedPorts.length > 0) {
+      for (const port of requestedPorts) {
         if (!state.ports[String(port)]) {
           throw new CliError(`port ${port} is not acquired by bay`);
         }
       }
-      portsToRelease = [...requested];
-    } else {
-      portsToRelease = Object.values(state.ports)
-        .filter((record) => record.cwd === cwd)
-        .map((record) => record.port)
-        .sort((left, right) => left - right);
     }
 
     for (const port of portsToRelease) {
@@ -697,70 +462,172 @@ async function handleRelease(args: string[]): Promise<number> {
   for (const port of released) {
     printLine(String(port));
   }
-
-  return 0;
 }
 
-function handleHelp(args: string[]): number {
-  if (args.length === 0) {
-    printLine(HELP_TEXT);
-    return 0;
+async function showInfo(port: number | undefined, all: boolean): Promise<void> {
+  const state = await withLock(async () => await readState());
+
+  if (port !== undefined) {
+    await printSinglePortInfo(port, state.ports[String(port)]);
+    return;
   }
 
-  if (args.length > 1) {
-    throw new CliError("help accepts at most one command name", 2);
-  }
+  const cwd = await getCurrentDir();
+  const records = Object.values(state.ports)
+    .filter((record) => all || record.cwd === cwd)
+    .sort((left, right) => left.port - right.port);
 
-  const topic = args[0];
-  switch (topic) {
-    case "acquire":
-      printLine(ACQUIRE_HELP);
-      return 0;
-    case "check":
-      printLine(CHECK_HELP);
-      return 0;
-    case "info":
-      printLine(INFO_HELP);
-      return 0;
-    case "release":
-      printLine(RELEASE_HELP);
-      return 0;
-    default:
-      throw new CliError(`unknown help topic "${topic}"`, 2);
-  }
+  await printPortTable(records);
 }
 
-async function run(argv: string[]): Promise<number> {
-  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
-    printLine(HELP_TEXT);
-    return 0;
-  }
+function commandNotes(lines: string[]): string {
+  return `\n${lines.join("\n")}\n`;
+}
 
-  const [command, ...args] = argv;
+function createProgram(): Command {
+  const program = new Command();
 
-  switch (command) {
-    case "acquire":
-      return await handleAcquire(args);
-    case "check":
-      return await handleCheck(args);
-    case "info":
-      return await handleInfo(args);
-    case "release":
-      return await handleRelease(args);
-    case "help":
-      return handleHelp(args);
-    default:
-      throw new CliError(`unknown command "${command}"`, 2);
-  }
+  program
+    .name("bay")
+    .description("Acquire, inspect, and release local TCP ports tracked by bay.")
+    .version(packageJson.version)
+    .showHelpAfterError()
+    .showSuggestionAfterError()
+    .addHelpCommand("help [command]", "show help for command")
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Shell-friendly output:",
+        "  PORT=$(bay acquire)",
+        "  readarray -t PORTS < <(bay acquire -n 5)",
+        "",
+        "State directories:",
+        "  Linux config: $XDG_CONFIG_HOME/bay or ~/.config/bay",
+        "  Linux state:  $XDG_STATE_HOME/bay or ~/.local/state/bay",
+        "  macOS config: ~/Library/Application Support/bay",
+        "  macOS state:  ~/Library/Application Support/bay/state",
+      ]),
+    );
+
+  program
+    .command("acquire")
+    .summary("Acquire one free port, many free ports, or named ports")
+    .description("Acquire ports and track them in bay's state file.")
+    .argument("[ports...]", "specific ports to acquire")
+    .option("-n, --count <count>", "acquire COUNT free ports", parseCount)
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Examples:",
+        "  bay acquire",
+        "  bay acquire -n 5",
+        "  bay acquire 3000 3001 3002",
+        "",
+        "Notes:",
+        "  - with no arguments, acquires exactly one free port",
+        "  - successful output is port numbers only, one per line",
+        "  - requests are atomic: if one requested port fails, none are stored",
+      ]),
+    )
+    .action(async (ports: string[], options: { count?: number }) => {
+      const namedPorts = ports.map(parsePort);
+      if (options.count !== undefined && namedPorts.length > 0) {
+        throw new CliError("cannot combine --count with named ports", 2);
+      }
+
+      await acquirePorts(namedPorts, options.count);
+    });
+
+  program
+    .command("check")
+    .summary("Check whether a port is currently free")
+    .description("Check whether a TCP port is currently free to bind.")
+    .argument("<port>", "port to probe", parsePort)
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Output:",
+        "  free",
+        "  in-use",
+        "",
+        "Exit codes:",
+        "  0 if the port is free",
+        "  1 if the port is currently in use",
+      ]),
+    )
+    .action(async (port: number) => {
+      const free = await isPortFree(port);
+      printLine(free ? "free" : "in-use");
+      if (!free) {
+        process.exitCode = 1;
+      }
+    });
+
+  program
+    .command("info")
+    .summary("Show metadata and current status for tracked ports")
+    .description("Show tracked metadata and current port status.")
+    .argument("[port]", "specific port to inspect", parsePort)
+    .option("--all", "show all tracked ports")
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Examples:",
+        "  bay info",
+        "  bay info --all",
+        "  bay info 3000",
+        "",
+        "Notes:",
+        "  - without arguments, shows ports acquired in the current directory",
+        "  - tracked ports include a live free/in-use check",
+      ]),
+    )
+    .action(async (port: number | undefined, options: { all?: boolean }) => {
+      if (port !== undefined && options.all) {
+        throw new CliError("cannot combine --all with a specific port", 2);
+      }
+
+      await showInfo(port, Boolean(options.all));
+    });
+
+  program
+    .command("release")
+    .summary("Release tracked ports")
+    .description("Release ports tracked by bay.")
+    .argument("[ports...]", "specific ports to release")
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Examples:",
+        "  bay release",
+        "  bay release 3000 3001",
+        "",
+        "Notes:",
+        "  - with no arguments, releases ports acquired in the current directory",
+        "  - successful output is released port numbers only, one per line",
+        "  - named releases are atomic: if one port is missing, none are removed",
+      ]),
+    )
+    .action(async (ports: string[]) => {
+      await releasePorts(ports.map(parsePort));
+    });
+
+  return program;
 }
 
 async function main(): Promise<void> {
+  const program = createProgram();
+
   try {
-    const exitCode = await run(process.argv.slice(2));
-    process.exit(exitCode);
+    const argv = process.argv.slice(2);
+    await program.parseAsync(argv.length === 0 ? ["--help"] : argv, { from: "user" });
   } catch (error) {
     if (error instanceof CliError) {
       printError(error.message);
+      process.exit(error.exitCode);
+    }
+
+    if (error instanceof CommanderError) {
       process.exit(error.exitCode);
     }
 
