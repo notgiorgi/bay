@@ -66,6 +66,18 @@ bun run build
 
 This writes `dist/bay`.
 
+## Nix
+
+The repo now includes a `flake.nix`.
+
+```bash
+nix develop
+nix build
+nix run . -- acquire
+```
+
+`nix build` produces the packaged `bay` binary in `result/bin/bay`, and `nix develop` gives you a shell with `bun` and `git`.
+
 ## Development
 
 ```bash

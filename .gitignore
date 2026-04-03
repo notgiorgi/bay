@@ -5,6 +5,7 @@ node_modules
 out
 dist
 *.tgz
+result
 
 # code coverage
 coverage
@@ -36,3 +37,4 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # local editor / assistant metadata
 .cursor
 CLAUDE.md
+.direnv
