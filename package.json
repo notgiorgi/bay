@@ -1,0 +1,30 @@
+{
+  "name": "bay",
+  "version": "0.1.0",
+  "description": "Track and reserve local development ports from a Bun CLI.",
+  "module": "index.ts",
+  "bin": {
+    "bay": "./index.ts"
+  },
+  "type": "module",
+  "packageManager": "bun@1.3.11",
+  "scripts": {
+    "dev": "bun run ./index.ts",
+    "test": "bun test",
+    "build": "mkdir -p dist && bun build ./index.ts --compile --outfile ./dist/bay"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/notgiorgi/bay.git"
+  },
+  "homepage": "https://github.com/notgiorgi/bay",
+  "bugs": {
+    "url": "https://github.com/notgiorgi/bay/issues"
+  },
+  "keywords": [
+    "bun",
+    "cli",
+    "ports"
+  ],
+  "license": "MIT"
+}
