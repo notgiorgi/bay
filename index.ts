@@ -356,7 +356,7 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
   const rows = await Promise.all(
     records.map(async ([port, record]) => ({
       port: String(port),
-      free: (await isPortFree(port)) ? "yes" : "no",
+      usedByProcess: (await isPortFree(port)) ? "no" : "yes",
       dir: record.dir,
       acquiredAt: record.acquired_at,
     })),
@@ -364,7 +364,10 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
 
   const widths = {
     port: Math.max("PORT".length, ...rows.map((row) => row.port.length)),
-    free: Math.max("FREE".length, ...rows.map((row) => row.free.length)),
+    usedByProcess: Math.max(
+      "USED_BY_PROCESS".length,
+      ...rows.map((row) => row.usedByProcess.length),
+    ),
     dir: Math.max("DIRECTORY".length, ...rows.map((row) => row.dir.length)),
     acquiredAt: Math.max("ACQUIRED_AT".length, ...rows.map((row) => row.acquiredAt.length)),
   };
@@ -372,7 +375,7 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
   printLine(
     [
       pad("PORT", widths.port),
-      pad("FREE", widths.free),
+      pad("USED_BY_PROCESS", widths.usedByProcess),
       pad("DIRECTORY", widths.dir),
       pad("ACQUIRED_AT", widths.acquiredAt),
     ].join("  "),
@@ -382,7 +385,7 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
     printLine(
       [
         pad(row.port, widths.port),
-        pad(row.free, widths.free),
+        pad(row.usedByProcess, widths.usedByProcess),
         pad(row.dir, widths.dir),
         pad(row.acquiredAt, widths.acquiredAt),
       ].join("  "),
