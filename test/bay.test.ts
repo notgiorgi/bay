@@ -61,6 +61,10 @@ async function runBay(
   return { exitCode, stdout, stderr };
 }
 
+function stateFilePath(options: { env: NodeJS.ProcessEnv }): string {
+  return path.join(options.env.XDG_STATE_HOME!, "bay", "state.json");
+}
+
 async function getFreePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
     const server = createServer();
@@ -124,6 +128,29 @@ describe("bay cli", () => {
 
     expect(ports).toHaveLength(3);
     expect(new Set(ports).size).toBe(3);
+  });
+
+  test("acquire writes the requested on-disk state format", async () => {
+    const sandbox = await makeSandbox();
+    const acquire = await runBay(["acquire"], sandbox);
+    const port = acquire.stdout.trim();
+    const state = JSON.parse(await fs.readFile(stateFilePath(sandbox), "utf8")) as {
+      version: number;
+      ports: Record<string, Record<string, unknown>>;
+    };
+
+    expect(state.version).toBe(1);
+    expect(state.ports[port]).toBeDefined();
+    expect(state.ports[port]?.dir).toBe(await fs.realpath(sandbox.cwd));
+    expect(state.ports[port]?.hostname).toBeDefined();
+    expect(state.ports[port]?.user).toBeDefined();
+    expect(state.ports[port]?.pid).toBeTypeOf("number");
+    expect(state.ports[port]?.acquired_at).toBeTypeOf("string");
+    expect(state.ports[port]?.cwd).toBeUndefined();
+    expect(state.ports[port]?.username).toBeUndefined();
+    expect(state.ports[port]?.acquiredByPid).toBeUndefined();
+    expect(state.ports[port]?.acquiredAt).toBeUndefined();
+    expect(state.ports[port]?.port).toBeUndefined();
   });
 
   test("named acquire is atomic when one requested port is already in use", async () => {

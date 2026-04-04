@@ -1,20 +1,32 @@
 #!/usr/bin/env bun
-
 import { promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { Command, CommanderError, InvalidArgumentError } from "commander";
+import lockfile from "proper-lockfile";
 import packageJson from "./package.json" with { type: "json" };
 
 type PortRecord = {
-  port: number;
-  cwd: string;
-  acquiredAt: string;
-  acquiredByPid: number;
+  dir: string;
   hostname: string;
-  username: string;
+  user: string;
+  pid: number;
+  acquired_at: string;
+};
+
+type LegacyPortRecord = {
+  port?: number;
+  cwd?: string;
+  acquiredAt?: string;
+  acquiredByPid?: number;
+  hostname?: string;
+  username?: string;
+  dir?: string;
+  user?: string;
+  pid?: number;
+  acquired_at?: string;
 };
 
 type BayState = {
@@ -107,7 +119,6 @@ function statePaths() {
   const stateDir = resolveStateDir();
   return {
     stateDir,
-    lockPath: path.join(stateDir, "lock.json"),
     statePath: path.join(stateDir, "state.json"),
   };
 }
@@ -123,9 +134,13 @@ async function readState(): Promise<BayState> {
   try {
     const raw = await fs.readFile(statePath, "utf8");
     const parsed = JSON.parse(raw) as Partial<BayState>;
+    const portEntries = Object.entries(parsed.ports ?? {}).map(([port, record]) => [
+      port,
+      normalizeRecord(port, record as LegacyPortRecord),
+    ]);
     return {
       version: 1,
-      ports: parsed.ports ?? {},
+      ports: Object.fromEntries(portEntries),
     };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -133,6 +148,25 @@ async function readState(): Promise<BayState> {
     }
     throw error;
   }
+}
+
+function normalizeRecord(port: string, record: LegacyPortRecord): PortRecord {
+  const dir = record.dir ?? record.cwd;
+  const user = record.user ?? record.username;
+  const pid = record.pid ?? record.acquiredByPid;
+  const acquiredAt = record.acquired_at ?? record.acquiredAt;
+
+  if (!dir || !record.hostname || !user || typeof pid !== "number" || !acquiredAt) {
+    throw new CliError(`invalid state entry for port ${port}`);
+  }
+
+  return {
+    dir,
+    hostname: record.hostname,
+    user,
+    pid,
+    acquired_at: acquiredAt,
+  };
 }
 
 async function writeState(state: BayState): Promise<void> {
@@ -143,79 +177,38 @@ async function writeState(state: BayState): Promise<void> {
   await fs.rename(tempPath, statePath);
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") {
-      return false;
-    }
-    return true;
-  }
-}
-
-async function maybeRemoveStaleLock(lockPath: string): Promise<boolean> {
-  try {
-    const raw = await fs.readFile(lockPath, "utf8");
-    const parsed = JSON.parse(raw) as { pid?: number };
-    if (typeof parsed.pid === "number" && !isProcessAlive(parsed.pid)) {
-      await fs.rm(lockPath, { force: true });
-      return true;
-    }
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
-      return true;
-    }
-    if (error instanceof SyntaxError) {
-      await fs.rm(lockPath, { force: true }).catch(() => undefined);
-      return true;
-    }
-  }
-
-  return false;
-}
-
 async function withLock<T>(action: () => Promise<T>): Promise<T> {
   await ensureStateDir();
-  const { lockPath } = statePaths();
-  const deadline = Date.now() + 10_000;
+  const { stateDir } = statePaths();
 
-  while (true) {
-    try {
-      const lockHandle = await fs.open(lockPath, "wx");
-      try {
-        await lockHandle.writeFile(
-          `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
-          "utf8",
-        );
-        return await action();
-      } finally {
-        await lockHandle.close().catch(() => undefined);
-        await fs.rm(lockPath, { force: true }).catch(() => undefined);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-
-      const cleared = await maybeRemoveStaleLock(lockPath);
-      if (cleared) {
-        continue;
-      }
-
-      if (Date.now() >= deadline) {
-        throw new CliError(`timed out waiting for bay lock at ${lockPath}`);
-      }
-
-      await sleep(25);
+  let release: (() => Promise<void>) | undefined;
+  try {
+    release = await lockfile.lock(stateDir, {
+      realpath: false,
+      lockfilePath: path.join(stateDir, "lock"),
+      stale: 15_000,
+      update: 5_000,
+      retries: {
+        retries: 400,
+        factor: 1,
+        minTimeout: 25,
+        maxTimeout: 25,
+      },
+      onCompromised(error) {
+        throw new CliError(`bay lock was compromised: ${error.message}`);
+      },
+    });
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new CliError(`timed out waiting for bay lock in ${stateDir}: ${error.message}`);
     }
+    throw new CliError(`timed out waiting for bay lock in ${stateDir}`);
+  }
+
+  try {
+    return await action();
+  } finally {
+    await release?.().catch(() => undefined);
   }
 }
 
@@ -324,14 +317,13 @@ async function getCurrentDir(): Promise<string> {
   return await fs.realpath(process.cwd());
 }
 
-function buildRecord(port: number, cwd: string): PortRecord {
+function buildRecord(cwd: string): PortRecord {
   return {
-    port,
-    cwd,
-    acquiredAt: new Date().toISOString(),
-    acquiredByPid: process.pid,
+    dir: cwd,
     hostname: os.hostname(),
-    username: os.userInfo().username,
+    user: os.userInfo().username,
+    pid: process.pid,
+    acquired_at: new Date().toISOString(),
   };
 }
 
@@ -348,32 +340,32 @@ async function printSinglePortInfo(port: number, record: PortRecord | undefined)
     return;
   }
 
-  printLine(`Directory: ${record.cwd}`);
-  printLine(`Acquired at: ${record.acquiredAt}`);
-  printLine(`Acquired by PID: ${record.acquiredByPid}`);
+  printLine(`Directory: ${record.dir}`);
+  printLine(`Acquired at: ${record.acquired_at}`);
+  printLine(`Acquired by PID: ${record.pid}`);
   printLine(`Hostname: ${record.hostname}`);
-  printLine(`User: ${record.username}`);
+  printLine(`User: ${record.user}`);
 }
 
-async function printPortTable(records: PortRecord[]): Promise<void> {
+async function printPortTable(records: readonly (readonly [number, PortRecord])[]): Promise<void> {
   if (records.length === 0) {
     printLine("No ports acquired by bay.");
     return;
   }
 
   const rows = await Promise.all(
-    records.map(async (record) => ({
-      port: String(record.port),
-      free: (await isPortFree(record.port)) ? "yes" : "no",
-      cwd: record.cwd,
-      acquiredAt: record.acquiredAt,
+    records.map(async ([port, record]) => ({
+      port: String(port),
+      free: (await isPortFree(port)) ? "yes" : "no",
+      dir: record.dir,
+      acquiredAt: record.acquired_at,
     })),
   );
 
   const widths = {
     port: Math.max("PORT".length, ...rows.map((row) => row.port.length)),
     free: Math.max("FREE".length, ...rows.map((row) => row.free.length)),
-    cwd: Math.max("DIRECTORY".length, ...rows.map((row) => row.cwd.length)),
+    dir: Math.max("DIRECTORY".length, ...rows.map((row) => row.dir.length)),
     acquiredAt: Math.max("ACQUIRED_AT".length, ...rows.map((row) => row.acquiredAt.length)),
   };
 
@@ -381,7 +373,7 @@ async function printPortTable(records: PortRecord[]): Promise<void> {
     [
       pad("PORT", widths.port),
       pad("FREE", widths.free),
-      pad("DIRECTORY", widths.cwd),
+      pad("DIRECTORY", widths.dir),
       pad("ACQUIRED_AT", widths.acquiredAt),
     ].join("  "),
   );
@@ -391,7 +383,7 @@ async function printPortTable(records: PortRecord[]): Promise<void> {
       [
         pad(row.port, widths.port),
         pad(row.free, widths.free),
-        pad(row.cwd, widths.cwd),
+        pad(row.dir, widths.dir),
         pad(row.acquiredAt, widths.acquiredAt),
       ].join("  "),
     );
@@ -416,7 +408,7 @@ async function acquirePorts(namedPorts: number[], count?: number): Promise<void>
     }
 
     for (const port of ports) {
-      state.ports[String(port)] = buildRecord(port, cwd);
+      state.ports[String(port)] = buildRecord(cwd);
     }
 
     await writeState(state);
@@ -438,9 +430,10 @@ async function releasePorts(requestedPorts: number[]): Promise<void> {
     const portsToRelease =
       requestedPorts.length > 0
         ? requestedPorts
-        : Object.values(state.ports)
-            .filter((record) => record.cwd === cwd)
-            .map((record) => record.port)
+        : Object.entries(state.ports)
+            .map(([port, record]) => [Number(port), record] as const)
+            .filter(([, record]) => record.dir === cwd)
+            .map(([port]) => port)
             .sort((left, right) => left - right);
 
     if (requestedPorts.length > 0) {
@@ -473,9 +466,10 @@ async function showInfo(port: number | undefined, all: boolean): Promise<void> {
   }
 
   const cwd = await getCurrentDir();
-  const records = Object.values(state.ports)
-    .filter((record) => all || record.cwd === cwd)
-    .sort((left, right) => left.port - right.port);
+  const records = Object.entries(state.ports)
+    .map(([port, record]) => [Number(port), record] as const)
+    .filter(([, record]) => all || record.dir === cwd)
+    .sort((left, right) => left[0] - right[0]);
 
   await printPortTable(records);
 }
