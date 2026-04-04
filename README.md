@@ -67,6 +67,27 @@ bun run build
 
 This writes `dist/bay`.
 
+## Install
+
+Install the latest GitHub release binary with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
+```
+
+or:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
+```
+
+You can also pin a specific release or install directory:
+
+```bash
+BAY_VERSION=v0.1.0 BAY_INSTALL_DIR=/usr/local/bin \
+  curl -fsSL https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
+```
+
 ## Nix
 
 The repo now includes a `flake.nix`.
