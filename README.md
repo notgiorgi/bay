@@ -2,70 +2,92 @@
 
 `bay` is a Bun CLI for reserving local development ports and tracking who acquired them.
 
-It gives you shell-friendly port acquisition:
+## Acquiring Ports
+
+Acquire one port and store it in a shell variable:
 
 ```bash
 PORT=$(bay acquire)
+echo "$PORT"
+```
+
+Acquire multiple free ports:
+
+```bash
 readarray -t PORTS < <(bay acquire -n 5)
+printf '%s\n' "${PORTS[@]}"
 ```
 
-It also keeps metadata about where a port was acquired, prevents duplicate acquisition across parallel CLI calls, and stores state in platform-appropriate XDG/macOS directories.
+Acquire specific ports:
 
-## Commands
-
-```text
-bay acquire
-bay acquire -n 5
+```bash
 bay acquire 3000 3001
+```
+
+Check whether a port is currently in use by any process:
+
+```bash
 bay check 3000
+```
+
+Get a stable, directory-scoped port:
+
+```bash
+PORT=$(bay get --tag backend)
+FE_PORT=$(bay get --tag front-end)
+```
+
+## Looking At Info
+
+Inspect one port:
+
+```bash
 bay info 3000
+```
+
+See ports acquired in the current directory:
+
+```bash
 bay info
+```
+
+See every port tracked by `bay`:
+
+```bash
 bay info --all
-bay release
+```
+
+Release specific ports or everything acquired in the current directory:
+
+```bash
 bay release 3000 3001
-bay help
-```
-
-## Examples
-
-```bash
-PORT=$(bay acquire)
-readarray -t PORTS < <(bay acquire -n 3)
-
-bay acquire 3000 3001
-bay check 3000
-bay info 3000
-bay info
-bay info --all
 bay release
 ```
 
-For local development before install:
+## Tagging And Namespacing
+
+Store metadata when acquiring:
 
 ```bash
-bun install
-bun run ./index.ts acquire
-bun run ./index.ts info --all
+bay acquire --tag backend
+bay acquire --namespace sales-app
+bay acquire --tag backend --namespace sales-app
 ```
 
-## State Storage
-
-`bay` stores data in standard per-user directories.
-
-- Linux config: `$XDG_CONFIG_HOME/bay` or `~/.config/bay`
-- Linux state: `$XDG_STATE_HOME/bay` or `~/.local/state/bay`
-- macOS config: `~/Library/Application Support/bay`
-- macOS state: `~/Library/Application Support/bay/state`
-
-## Build
-
-Build a single-file executable with Bun:
+Filter info by tag or namespace:
 
 ```bash
-bun run build
+bay info --tag backend
+bay info --namespace sales-app
+bay info --all --tag backend
 ```
 
-This writes `dist/bay`.
+Release only matching ports in the current directory:
+
+```bash
+bay release --tag backend
+bay release --namespace sales-app
+```
 
 ## Install
 
@@ -84,21 +106,38 @@ wget -qO- https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
 You can also pin a specific release or install directory:
 
 ```bash
-BAY_VERSION=v0.1.0 BAY_INSTALL_DIR=/usr/local/bin \
+BAY_VERSION=v0.1.1 BAY_INSTALL_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
 ```
 
-## Nix
+## Local Development
 
-The repo now includes a `flake.nix`.
+Run directly from the repo:
 
 ```bash
-nix develop
-nix build
-nix run . -- acquire
+bun install
+bun run ./index.ts acquire
+bun run ./index.ts info --all
 ```
 
-`nix build` produces the packaged `bay` binary in `result/bin/bay`, and `nix develop` gives you a shell with `bun` and `git`.
+## Build
+
+Build a single-file executable with Bun:
+
+```bash
+bun run build
+```
+
+This writes `dist/bay`.
+
+## State Storage
+
+`bay` stores data in standard per-user directories.
+
+- Linux config: `$XDG_CONFIG_HOME/bay` or `~/.config/bay`
+- Linux state: `$XDG_STATE_HOME/bay` or `~/.local/state/bay`
+- macOS config: `~/Library/Application Support/bay`
+- macOS state: `~/Library/Application Support/bay/state`
 
 ## Development
 
@@ -106,6 +145,27 @@ nix run . -- acquire
 bun install
 bun test
 bun run build
+```
+
+## Command Summary
+
+```text
+bay acquire
+bay acquire -n 5
+bay acquire 3000 3001
+bay acquire --tag backend --namespace sales-app
+bay get --tag backend
+bay check 3000
+bay info 3000
+bay info
+bay info --all
+bay info --tag backend
+bay release
+bay release 3000 3001
+bay release --tag backend
+bay release -k
+bay upgrade
+bay help
 ```
 
 ## Release CI
@@ -118,8 +178,8 @@ GitHub Actions is configured for:
 To cut a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 That workflow publishes GitHub release assets that are suitable for a later Homebrew formula.

@@ -235,6 +235,47 @@ describe("bay cli", () => {
     expect(info.stdout).toContain("Namespace: sales-app");
   });
 
+  test("get reuses an existing matching port in the current directory", async () => {
+    const sandbox = await makeSandbox();
+    const acquire = await runBay(["acquire", "--tag", "backend"], sandbox);
+    const acquiredPort = acquire.stdout.trim();
+
+    const get = await runBay(["get", "--tag", "backend"], sandbox);
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout.trim()).toBe(acquiredPort);
+  });
+
+  test("get acquires a port when no matching current-directory port exists", async () => {
+    const sandbox = await makeSandbox();
+    const get = await runBay(["get", "--tag", "backend", "--namespace", "sales-app"], sandbox);
+    const port = get.stdout.trim();
+    const info = await runBay(["info", port], sandbox);
+
+    expect(get.exitCode).toBe(0);
+    expect(Number.isInteger(Number(port))).toBe(true);
+    expect(info.stdout).toContain("Tag: backend");
+    expect(info.stdout).toContain("Namespace: sales-app");
+  });
+
+  test("get is scoped to the current directory", async () => {
+    const sandbox = await makeSandbox();
+    const otherAcquire = await runBay(["acquire", "--tag", "backend"], {
+      cwd: sandbox.otherCwd,
+      env: sandbox.env,
+    });
+    const otherPort = otherAcquire.stdout.trim();
+
+    const get = await runBay(["get", "--tag", "backend"], sandbox);
+    const localPort = get.stdout.trim();
+
+    expect(get.exitCode).toBe(0);
+    expect(localPort).not.toBe(otherPort);
+
+    const localInfo = await runBay(["info", localPort], sandbox);
+    expect(localInfo.stdout).toContain("Tracked by bay: yes");
+    expect(localInfo.stdout).toContain("Tag: backend");
+  });
+
   test("named acquire is atomic when one requested port is already in use", async () => {
     const sandbox = await makeSandbox();
     const freePort = await getFreePort();

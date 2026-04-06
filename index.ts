@@ -635,6 +635,17 @@ function matchesMetadataFilter(
   return true;
 }
 
+function matchingDirectoryRecords(
+  state: BayState,
+  cwd: string,
+  metadata: { tag?: string; namespace?: string },
+): (readonly [number, PortRecord])[] {
+  return Object.entries(state.ports)
+    .map(([port, record]) => [Number(port), record] as const)
+    .filter(([, record]) => record.dir === cwd && matchesMetadataFilter(record, metadata))
+    .sort((left, right) => left[0] - right[0]);
+}
+
 async function acquirePorts(
   namedPorts: number[],
   count: number | undefined,
@@ -669,6 +680,37 @@ async function acquirePorts(
   }
 }
 
+async function getPort(metadata: { tag?: string; namespace?: string }): Promise<void> {
+  const cwd = await getCurrentDir();
+
+  const port = await withLock(async () => {
+    const state = await readState();
+    const matches = matchingDirectoryRecords(state, cwd, metadata);
+
+    if (matches.length > 1) {
+      throw new CliError(
+        `multiple ports match in ${cwd}; narrow with --tag/--namespace or release duplicates`,
+      );
+    }
+
+    if (matches.length === 1) {
+      const match = matches[0];
+      if (!match) {
+        throw new CliError("expected one matching port");
+      }
+      const [matchingPort] = match;
+      return matchingPort;
+    }
+
+    const [allocatedPort] = await allocatePorts(1, state);
+    state.ports[String(allocatedPort)] = buildRecord(cwd, metadata);
+    await writeState(state);
+    return allocatedPort;
+  });
+
+  printLine(String(port));
+}
+
 async function releasePorts(
   requestedPorts: number[],
   metadata: { tag?: string; namespace?: string },
@@ -683,9 +725,7 @@ async function releasePorts(
     const portsToRelease =
       requestedPorts.length > 0
         ? requestedPorts
-        : Object.entries(state.ports)
-            .map(([port, record]) => [Number(port), record] as const)
-            .filter(([, record]) => record.dir === cwd && matchesMetadataFilter(record, metadata))
+        : matchingDirectoryRecords(state, cwd, metadata)
             .map(([port]) => port)
             .sort((left, right) => left - right);
 
@@ -803,6 +843,40 @@ function createProgram(): Command {
       }
 
       await acquirePorts(namedPorts, options.count, {
+        tag: options.tag,
+        namespace: options.namespace,
+      });
+    });
+
+  program
+    .command("get")
+    .summary("Reuse a matching current-directory port or acquire one")
+    .description(
+      "Return an existing matching port acquired in the current directory, or acquire a new one if none exists.",
+    )
+    .option("--tag <tag>", "match or store a tag on the port", (value) =>
+      parseMetadataValue(value, "tag"),
+    )
+    .option("--namespace <namespace>", "match or store a namespace on the port", (value) =>
+      parseMetadataValue(value, "namespace"),
+    )
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Examples:",
+        "  bay get",
+        "  bay get --tag backend",
+        "  bay get --tag backend --namespace sales-app",
+        "",
+        "Notes:",
+        "  - get is always scoped to the current directory",
+        "  - if one matching port already exists, bay prints it",
+        "  - if none exist, bay acquires one and prints it",
+        "  - if more than one match exists, bay errors instead of guessing",
+      ]),
+    )
+    .action(async (options: { tag?: string; namespace?: string }) => {
+      await getPort({
         tag: options.tag,
         namespace: options.namespace,
       });
