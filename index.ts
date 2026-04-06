@@ -5,10 +5,10 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { setTimeout as delay } from "node:timers/promises";
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import lockfile from "proper-lockfile";
 import packageJson from "./package.json" with { type: "json" };
+import { PortProcessManager } from "./portProcessManager";
 
 type PortRecord = {
   dir: string;
@@ -424,119 +424,6 @@ async function withLock<T>(action: () => Promise<T>): Promise<T> {
   }
 }
 
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") {
-      return false;
-    }
-
-    if (code === "EPERM") {
-      return true;
-    }
-
-    return false;
-  }
-}
-
-async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) {
-      return true;
-    }
-    await delay(50);
-  }
-
-  return !isPidAlive(pid);
-}
-
-async function findListeningPidsWithLsof(port: number): Promise<number[] | undefined> {
-  if (!Bun.which("lsof")) {
-    return undefined;
-  }
-
-  const result = await runCommand(["lsof", "-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"]);
-  if (result.exitCode !== 0 && result.exitCode !== 1) {
-    throw new CliError(`failed to inspect port ${port} with lsof: ${result.stderr.trim()}`);
-  }
-
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((value) => Number(value))
-    .filter((value) => Number.isInteger(value));
-}
-
-async function findListeningPidsWithSs(port: number): Promise<number[] | undefined> {
-  if (process.platform !== "linux" || !Bun.which("ss")) {
-    return undefined;
-  }
-
-  const result = await runCommand(["ss", "-ltnp", `sport = :${port}`]);
-  if (result.exitCode !== 0) {
-    throw new CliError(`failed to inspect port ${port} with ss: ${result.stderr.trim()}`);
-  }
-
-  const matches = result.stdout.matchAll(/pid=(\d+)/g);
-  return [...matches]
-    .map((match) => Number(match[1]))
-    .filter((value) => Number.isInteger(value));
-}
-
-async function findListeningPids(port: number): Promise<number[]> {
-  const lsofPids = await findListeningPidsWithLsof(port);
-  if (lsofPids !== undefined) {
-    return [...new Set(lsofPids)];
-  }
-
-  const ssPids = await findListeningPidsWithSs(port);
-  if (ssPids !== undefined) {
-    return [...new Set(ssPids)];
-  }
-
-  throw new CliError("could not inspect listening processes: install lsof or ss");
-}
-
-async function terminatePid(pid: number): Promise<void> {
-  if (!isPidAlive(pid)) {
-    return;
-  }
-
-  process.kill(pid, "SIGTERM");
-  if (await waitForPidExit(pid, 1500)) {
-    return;
-  }
-
-  process.kill(pid, "SIGKILL");
-  if (await waitForPidExit(pid, 1500)) {
-    return;
-  }
-
-  throw new CliError(`failed to terminate process ${pid}`);
-}
-
-async function killProcessesForPorts(ports: number[]): Promise<void> {
-  const pids = new Set<number>();
-
-  for (const port of ports) {
-    for (const pid of await findListeningPids(port)) {
-      if (pid !== process.pid) {
-        pids.add(pid);
-      }
-    }
-  }
-
-  for (const pid of [...pids].sort((left, right) => left - right)) {
-    await terminatePid(pid);
-  }
-}
-
 async function canBind(options: net.ListenOptions): Promise<"free" | "in-use" | "unsupported"> {
   return await new Promise((resolve) => {
     const server = net.createServer();
@@ -811,7 +698,11 @@ async function releasePorts(
     }
 
     if (kill) {
-      await killProcessesForPorts(portsToRelease);
+      try {
+        await PortProcessManager.killProcessesForPorts(portsToRelease);
+      } catch (error) {
+        throw new CliError(error instanceof Error ? error.message : "failed to kill processes");
+      }
     }
 
     for (const port of portsToRelease) {
