@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as delay } from "node:timers/promises";
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import lockfile from "proper-lockfile";
 import packageJson from "./package.json" with { type: "json" };
@@ -36,6 +38,16 @@ type LegacyPortRecord = {
 type BayState = {
   version: 1;
   ports: Record<string, PortRecord>;
+};
+
+type ReleaseAsset = {
+  name: string;
+  browser_download_url: string;
+};
+
+type ReleaseMetadata = {
+  tag_name: string;
+  assets: ReleaseAsset[];
 };
 
 class CliError extends Error {
@@ -192,6 +204,191 @@ async function writeState(state: BayState): Promise<void> {
   await fs.rename(tempPath, statePath);
 }
 
+async function runCommand(cmd: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn({
+    cmd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  return { exitCode, stdout, stderr };
+}
+
+function normalizedVersion(version: string): string {
+  return version.startsWith("v") ? version.slice(1) : version;
+}
+
+function compareVersions(left: string, right: string): number {
+  const leftParts = normalizedVersion(left).split(".").map((part) => Number(part));
+  const rightParts = normalizedVersion(right).split(".").map((part) => Number(part));
+  const maxLength = Math.max(leftParts.length, rightParts.length);
+
+  for (let index = 0; index < maxLength; index += 1) {
+    const leftPart = leftParts[index] ?? 0;
+    const rightPart = rightParts[index] ?? 0;
+    if (leftPart !== rightPart) {
+      return leftPart - rightPart;
+    }
+  }
+
+  return 0;
+}
+
+function detectReleaseOs(): string {
+  switch (process.platform) {
+    case "darwin":
+      return "macos";
+    case "linux":
+      return "linux";
+    default:
+      throw new CliError(`unsupported operating system: ${process.platform}`);
+  }
+}
+
+function detectReleaseArch(): string {
+  switch (process.arch) {
+    case "x64":
+      return "x64";
+    case "arm64":
+      return "arm64";
+    default:
+      throw new CliError(`unsupported architecture: ${process.arch}`);
+  }
+}
+
+function defaultInstallDir(): string {
+  const osName = detectReleaseOs();
+  const archName = detectReleaseArch();
+
+  if (osName === "macos" && archName === "arm64") {
+    return "/opt/homebrew/bin";
+  }
+
+  return "/usr/local/bin";
+}
+
+function resolveUpgradeTargetPath(): string {
+  if (process.env.BAY_UPGRADE_TARGET) {
+    return process.env.BAY_UPGRADE_TARGET;
+  }
+
+  if (path.basename(process.execPath) === "bay") {
+    return process.execPath;
+  }
+
+  return path.join(defaultInstallDir(), "bay");
+}
+
+async function fetchLatestRelease(): Promise<ReleaseMetadata> {
+  const releaseUrl =
+    process.env.BAY_RELEASE_API_URL ??
+    `https://api.github.com/repos/${process.env.BAY_GITHUB_OWNER ?? "notgiorgi"}/${process.env.BAY_GITHUB_REPO ?? "bay"}/releases/latest`;
+
+  const response = await fetch(releaseUrl, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "bay",
+    },
+  });
+
+  if (response.status === 404) {
+    throw new CliError(`no GitHub release found at ${releaseUrl}`);
+  }
+
+  if (!response.ok) {
+    throw new CliError(`failed to fetch latest release: ${response.status} ${response.statusText}`);
+  }
+
+  return (await response.json()) as ReleaseMetadata;
+}
+
+async function downloadFile(url: string, outputPath: string): Promise<void> {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "bay",
+    },
+  });
+
+  if (!response.ok) {
+    throw new CliError(`failed to download ${url}: ${response.status} ${response.statusText}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  await fs.writeFile(outputPath, buffer);
+}
+
+async function verifyDownloadedChecksum(archivePath: string, checksumPath: string): Promise<void> {
+  const expected = (await fs.readFile(checksumPath, "utf8")).trim().split(/\s+/)[0];
+  const hash = createHash("sha256");
+  hash.update(await fs.readFile(archivePath));
+  const actual = hash.digest("hex");
+
+  if (expected !== actual) {
+    throw new CliError(`checksum mismatch for ${path.basename(archivePath)}`);
+  }
+}
+
+async function upgradeBay(): Promise<void> {
+  const currentVersion = packageJson.version;
+  const release = await fetchLatestRelease();
+  const latestVersion = normalizedVersion(release.tag_name);
+
+  if (compareVersions(currentVersion, latestVersion) >= 0) {
+    printLine(`bay ${currentVersion} is already up to date`);
+    return;
+  }
+
+  const archiveSuffix = `${detectReleaseOs()}-${detectReleaseArch()}`;
+  const archiveName = `bay-${release.tag_name}-${archiveSuffix}.tar.gz`;
+  const checksumName = `${archiveName}.sha256`;
+  const archiveAsset = release.assets.find((asset) => asset.name === archiveName);
+  const checksumAsset = release.assets.find((asset) => asset.name === checksumName);
+
+  if (!archiveAsset) {
+    throw new CliError(`release ${release.tag_name} does not include ${archiveName}`);
+  }
+
+  if (!checksumAsset) {
+    throw new CliError(`release ${release.tag_name} does not include ${checksumName}`);
+  }
+
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "bay-upgrade-"));
+  try {
+    const archivePath = path.join(workDir, archiveName);
+    const checksumPath = path.join(workDir, checksumName);
+    const extractDir = path.join(workDir, "extract");
+    const targetPath = resolveUpgradeTargetPath();
+    const targetDir = path.dirname(targetPath);
+    const tempTargetPath = `${targetPath}.${process.pid}.tmp`;
+
+    await downloadFile(archiveAsset.browser_download_url, archivePath);
+    await downloadFile(checksumAsset.browser_download_url, checksumPath);
+    await verifyDownloadedChecksum(archivePath, checksumPath);
+
+    await fs.mkdir(extractDir, { recursive: true });
+    const tarResult = await runCommand(["tar", "-xzf", archivePath, "-C", extractDir]);
+    if (tarResult.exitCode !== 0) {
+      throw new CliError(`failed to extract ${archiveName}: ${tarResult.stderr.trim()}`);
+    }
+
+    const sourceBinary = path.join(extractDir, "bay");
+    await fs.mkdir(targetDir, { recursive: true });
+    await fs.copyFile(sourceBinary, tempTargetPath);
+    await fs.chmod(tempTargetPath, 0o755);
+    await fs.rename(tempTargetPath, targetPath);
+
+    printLine(`Upgraded bay ${currentVersion} -> ${latestVersion} at ${targetPath}`);
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true });
+  }
+}
+
 async function withLock<T>(action: () => Promise<T>): Promise<T> {
   await ensureStateDir();
   const { stateDir } = statePaths();
@@ -224,6 +421,119 @@ async function withLock<T>(action: () => Promise<T>): Promise<T> {
     return await action();
   } finally {
     await release?.().catch(() => undefined);
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") {
+      return false;
+    }
+
+    if (code === "EPERM") {
+      return true;
+    }
+
+    return false;
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) {
+      return true;
+    }
+    await delay(50);
+  }
+
+  return !isPidAlive(pid);
+}
+
+async function findListeningPidsWithLsof(port: number): Promise<number[] | undefined> {
+  if (!Bun.which("lsof")) {
+    return undefined;
+  }
+
+  const result = await runCommand(["lsof", "-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"]);
+  if (result.exitCode !== 0 && result.exitCode !== 1) {
+    throw new CliError(`failed to inspect port ${port} with lsof: ${result.stderr.trim()}`);
+  }
+
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value));
+}
+
+async function findListeningPidsWithSs(port: number): Promise<number[] | undefined> {
+  if (process.platform !== "linux" || !Bun.which("ss")) {
+    return undefined;
+  }
+
+  const result = await runCommand(["ss", "-ltnp", `sport = :${port}`]);
+  if (result.exitCode !== 0) {
+    throw new CliError(`failed to inspect port ${port} with ss: ${result.stderr.trim()}`);
+  }
+
+  const matches = result.stdout.matchAll(/pid=(\d+)/g);
+  return [...matches]
+    .map((match) => Number(match[1]))
+    .filter((value) => Number.isInteger(value));
+}
+
+async function findListeningPids(port: number): Promise<number[]> {
+  const lsofPids = await findListeningPidsWithLsof(port);
+  if (lsofPids !== undefined) {
+    return [...new Set(lsofPids)];
+  }
+
+  const ssPids = await findListeningPidsWithSs(port);
+  if (ssPids !== undefined) {
+    return [...new Set(ssPids)];
+  }
+
+  throw new CliError("could not inspect listening processes: install lsof or ss");
+}
+
+async function terminatePid(pid: number): Promise<void> {
+  if (!isPidAlive(pid)) {
+    return;
+  }
+
+  process.kill(pid, "SIGTERM");
+  if (await waitForPidExit(pid, 1500)) {
+    return;
+  }
+
+  process.kill(pid, "SIGKILL");
+  if (await waitForPidExit(pid, 1500)) {
+    return;
+  }
+
+  throw new CliError(`failed to terminate process ${pid}`);
+}
+
+async function killProcessesForPorts(ports: number[]): Promise<void> {
+  const pids = new Set<number>();
+
+  for (const port of ports) {
+    for (const pid of await findListeningPids(port)) {
+      if (pid !== process.pid) {
+        pids.add(pid);
+      }
+    }
+  }
+
+  for (const pid of [...pids].sort((left, right) => left - right)) {
+    await terminatePid(pid);
   }
 }
 
@@ -475,6 +785,7 @@ async function acquirePorts(
 async function releasePorts(
   requestedPorts: number[],
   metadata: { tag?: string; namespace?: string },
+  kill: boolean,
 ): Promise<void> {
   ensureUniquePorts(requestedPorts);
   const cwd = await getCurrentDir();
@@ -497,6 +808,10 @@ async function releasePorts(
           throw new CliError(`port ${port} is not acquired by bay`);
         }
       }
+    }
+
+    if (kill) {
+      await killProcessesForPorts(portsToRelease);
     }
 
     for (const port of portsToRelease) {
@@ -628,6 +943,23 @@ function createProgram(): Command {
     });
 
   program
+    .command("upgrade")
+    .summary("Install the latest bay release for this platform")
+    .description("Check for a newer GitHub release and install it.")
+    .addHelpText(
+      "after",
+      commandNotes([
+        "Notes:",
+        "  - installs the latest GitHub release matching the current OS and architecture",
+        "  - by default upgrades the current bay binary, or falls back to a standard install path",
+        "  - BAY_UPGRADE_TARGET can override the installation path",
+      ]),
+    )
+    .action(async () => {
+      await upgradeBay();
+    });
+
+  program
     .command("info")
     .summary("Show metadata and current status for tracked ports")
     .description("Show tracked metadata and current port status.")
@@ -671,6 +1003,7 @@ function createProgram(): Command {
     .summary("Release tracked ports")
     .description("Release ports tracked by bay.")
     .argument("[ports...]", "specific ports to release")
+    .option("-k, --kill", "kill processes bound to the released ports before releasing")
     .option("--tag <tag>", "release only ports with this tag", (value) =>
       parseMetadataValue(value, "tag"),
     )
@@ -692,7 +1025,7 @@ function createProgram(): Command {
         "  - named releases are atomic: if one port is missing, none are removed",
       ]),
     )
-    .action(async (ports: string[], options: { tag?: string; namespace?: string }) => {
+    .action(async (ports: string[], options: { kill?: boolean; tag?: string; namespace?: string }) => {
       if (ports.length > 0 && (options.tag !== undefined || options.namespace !== undefined)) {
         throw new CliError("cannot combine --tag/--namespace with explicit ports", 2);
       }
@@ -700,7 +1033,7 @@ function createProgram(): Command {
       await releasePorts(ports.map(parsePort), {
         tag: options.tag,
         namespace: options.namespace,
-      });
+      }, Boolean(options.kill));
     });
 
   return program;

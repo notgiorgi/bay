@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import packageJson from "../package.json" with { type: "json" };
 
 const repoDir = path.resolve(import.meta.dir, "..");
 const cliPath = path.join(repoDir, "index.ts");
@@ -63,6 +67,65 @@ async function runBay(
 
 function stateFilePath(options: { env: NodeJS.ProcessEnv }): string {
   return path.join(options.env.XDG_STATE_HOME!, "bay", "state.json");
+}
+
+function releaseAssetSuffix(): string {
+  const osName =
+    process.platform === "darwin"
+      ? "macos"
+      : process.platform === "linux"
+        ? "linux"
+        : "unsupported";
+  const archName =
+    process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : "unsupported";
+
+  if (osName === "unsupported" || archName === "unsupported") {
+    throw new Error(`unsupported platform for test: ${process.platform}/${process.arch}`);
+  }
+
+  return `${osName}-${archName}`;
+}
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (await predicate()) {
+      return;
+    }
+    await delay(50);
+  }
+
+  throw new Error("timed out waiting for condition");
+}
+
+async function spawnListeningProcess(port: number) {
+  const proc = Bun.spawn({
+    cmd: [
+      "bun",
+      "--eval",
+      `
+        import net from "node:net";
+        const port = Number(process.argv.at(-1));
+        const server = net.createServer();
+        server.listen(port, "127.0.0.1");
+        setInterval(() => {}, 1000);
+      `,
+      String(port),
+    ],
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+
+  await waitFor(async () => {
+    const check = await runBay(["check", String(port)], {
+      cwd: repoDir,
+      env: process.env,
+    });
+    return check.exitCode === 1;
+  });
+
+  return proc;
 }
 
 async function getFreePort(): Promise<number> {
@@ -228,6 +291,140 @@ describe("bay cli", () => {
 
     const secondInfo = await runBay(["info", String(secondPort)], sandbox);
     expect(secondInfo.stdout).toContain("Tracked by bay: yes");
+  });
+
+  test("release --kill terminates listening processes on released ports", async () => {
+    const sandbox = await makeSandbox();
+    const port = await getFreePort();
+    const acquire = await runBay(["acquire", String(port)], sandbox);
+    expect(acquire.exitCode).toBe(0);
+
+    const listener = await spawnListeningProcess(port);
+
+    try {
+      const release = await runBay(["release", "--kill", String(port)], sandbox);
+      expect(release.exitCode).toBe(0);
+      expect(release.stdout.trim()).toBe(String(port));
+
+      await Promise.race([
+        listener.exited,
+        (async () => {
+          await delay(3_000);
+          throw new Error("listener process did not exit");
+        })(),
+      ]);
+
+      const check = await runBay(["check", String(port)], sandbox);
+      expect(check.exitCode).toBe(0);
+      expect(check.stdout.trim()).toBe("free");
+    } finally {
+      listener.kill();
+    }
+  });
+
+  test("upgrade installs the latest matching release asset", async () => {
+    const sandbox = await makeSandbox();
+    const releaseTag = "v0.2.0";
+    const currentVersion = packageJson.version;
+    const archiveName = `bay-${releaseTag}-${releaseAssetSuffix()}.tar.gz`;
+    const archivePath = path.join(sandbox.cwd, archiveName);
+    const checksumPath = `${archivePath}.sha256`;
+    const packageDir = path.join(sandbox.cwd, "upgrade-package");
+    const installDir = path.join(sandbox.cwd, "bin");
+    const targetPath = path.join(installDir, "bay");
+    const installedContents = "#!/bin/sh\necho upgraded\n";
+
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(path.join(packageDir, "bay"), installedContents, { mode: 0o755 });
+
+    const tar = Bun.spawn({
+      cmd: ["tar", "-czf", archivePath, "-C", packageDir, "bay"],
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const tarExitCode = await tar.exited;
+    expect(tarExitCode).toBe(0);
+
+    const checksum = createHash("sha256").update(await fs.readFile(archivePath)).digest("hex");
+    await fs.writeFile(checksumPath, `${checksum}  ${archiveName}\n`);
+
+    let serverPort = 0;
+    const server = createHttpServer((request, response) => {
+      if (!request.url) {
+        response.statusCode = 400;
+        response.end();
+        return;
+      }
+
+      if (request.url === "/latest") {
+        response.setHeader("content-type", "application/json");
+        response.end(
+          JSON.stringify({
+            tag_name: releaseTag,
+            assets: [
+              {
+                name: archiveName,
+                browser_download_url: `http://127.0.0.1:${serverPort}/${archiveName}`,
+              },
+              {
+                name: `${archiveName}.sha256`,
+                browser_download_url: `http://127.0.0.1:${serverPort}/${archiveName}.sha256`,
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
+      if (request.url === `/${archiveName}`) {
+        fs.readFile(archivePath).then((data) => response.end(data));
+        return;
+      }
+
+      if (request.url === `/${archiveName}.sha256`) {
+        fs.readFile(checksumPath, "utf8").then((data) => response.end(data));
+        return;
+      }
+
+      response.statusCode = 404;
+      response.end();
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+      server.once("error", reject);
+    });
+
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected http server address");
+    }
+    serverPort = address.port;
+
+    try {
+      const upgrade = await runBay(["upgrade"], {
+        cwd: sandbox.cwd,
+        env: {
+          ...sandbox.env,
+          BAY_RELEASE_API_URL: `http://127.0.0.1:${serverPort}/latest`,
+          BAY_UPGRADE_TARGET: targetPath,
+        },
+      });
+
+      expect(upgrade.exitCode).toBe(0);
+      expect(upgrade.stdout).toContain(`Upgraded bay ${currentVersion} -> 0.2.0`);
+      expect(await fs.readFile(targetPath, "utf8")).toBe(installedContents);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    }
   });
 
   test("info and release can filter by tag and namespace", async () => {
