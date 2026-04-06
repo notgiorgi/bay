@@ -153,6 +153,25 @@ describe("bay cli", () => {
     expect(state.ports[port]?.port).toBeUndefined();
   });
 
+  test("acquire stores tag and namespace metadata and info shows them", async () => {
+    const sandbox = await makeSandbox();
+    const acquire = await runBay(
+      ["acquire", "--tag", "backend", "--namespace", "sales-app"],
+      sandbox,
+    );
+    const port = acquire.stdout.trim();
+    const state = JSON.parse(await fs.readFile(stateFilePath(sandbox), "utf8")) as {
+      ports: Record<string, Record<string, unknown>>;
+    };
+
+    expect(state.ports[port]?.tag).toBe("backend");
+    expect(state.ports[port]?.namespace).toBe("sales-app");
+
+    const info = await runBay(["info", port], sandbox);
+    expect(info.stdout).toContain("Tag: backend");
+    expect(info.stdout).toContain("Namespace: sales-app");
+  });
+
   test("named acquire is atomic when one requested port is already in use", async () => {
     const sandbox = await makeSandbox();
     const freePort = await getFreePort();
@@ -209,6 +228,41 @@ describe("bay cli", () => {
 
     const secondInfo = await runBay(["info", String(secondPort)], sandbox);
     expect(secondInfo.stdout).toContain("Tracked by bay: yes");
+  });
+
+  test("info and release can filter by tag and namespace", async () => {
+    const sandbox = await makeSandbox();
+
+    const backendAcquire = await runBay(
+      ["acquire", "--tag", "backend", "--namespace", "sales-app"],
+      sandbox,
+    );
+    const frontendAcquire = await runBay(
+      ["acquire", "--tag", "frontend", "--namespace", "sales-app"],
+      sandbox,
+    );
+    const backendPort = backendAcquire.stdout.trim();
+    const frontendPort = frontendAcquire.stdout.trim();
+
+    const infoByTag = await runBay(["info", "--tag", "backend"], sandbox);
+    expect(infoByTag.stdout).toContain(backendPort);
+    expect(infoByTag.stdout).toContain("backend");
+    expect(infoByTag.stdout).not.toContain(frontendPort);
+
+    const infoByNamespace = await runBay(["info", "--namespace", "sales-app"], sandbox);
+    expect(infoByNamespace.stdout).toContain(backendPort);
+    expect(infoByNamespace.stdout).toContain(frontendPort);
+    expect(infoByNamespace.stdout).toContain("sales-app");
+
+    const release = await runBay(["release", "--tag", "backend"], sandbox);
+    expect(release.exitCode).toBe(0);
+    expect(release.stdout.trim()).toBe(backendPort);
+
+    const backendInfo = await runBay(["info", backendPort], sandbox);
+    expect(backendInfo.stdout).toContain("Tracked by bay: no");
+
+    const frontendInfo = await runBay(["info", frontendPort], sandbox);
+    expect(frontendInfo.stdout).toContain("Tracked by bay: yes");
   });
 
   test("parallel acquires do not return duplicate ports", async () => {

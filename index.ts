@@ -14,6 +14,8 @@ type PortRecord = {
   user: string;
   pid: number;
   acquired_at: string;
+  tag?: string;
+  namespace?: string;
 };
 
 type LegacyPortRecord = {
@@ -27,6 +29,8 @@ type LegacyPortRecord = {
   user?: string;
   pid?: number;
   acquired_at?: string;
+  tag?: string;
+  namespace?: string;
 };
 
 type BayState = {
@@ -75,6 +79,15 @@ function parseCount(value: string): number {
   }
 
   return count;
+}
+
+function parseMetadataValue(value: string, fieldName: "tag" | "namespace"): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new InvalidArgumentError(`${fieldName} cannot be empty`);
+  }
+
+  return trimmed;
 }
 
 function ensureUniquePorts(ports: number[]): void {
@@ -166,6 +179,8 @@ function normalizeRecord(port: string, record: LegacyPortRecord): PortRecord {
     user,
     pid,
     acquired_at: acquiredAt,
+    ...(record.tag ? { tag: record.tag } : {}),
+    ...(record.namespace ? { namespace: record.namespace } : {}),
   };
 }
 
@@ -317,13 +332,18 @@ async function getCurrentDir(): Promise<string> {
   return await fs.realpath(process.cwd());
 }
 
-function buildRecord(cwd: string): PortRecord {
+function buildRecord(
+  cwd: string,
+  metadata: { tag?: string; namespace?: string },
+): PortRecord {
   return {
     dir: cwd,
     hostname: os.hostname(),
     user: os.userInfo().username,
     pid: process.pid,
     acquired_at: new Date().toISOString(),
+    ...(metadata.tag ? { tag: metadata.tag } : {}),
+    ...(metadata.namespace ? { namespace: metadata.namespace } : {}),
   };
 }
 
@@ -345,6 +365,8 @@ async function printSinglePortInfo(port: number, record: PortRecord | undefined)
   printLine(`Acquired by PID: ${record.pid}`);
   printLine(`Hostname: ${record.hostname}`);
   printLine(`User: ${record.user}`);
+  printLine(`Tag: ${record.tag ?? "-"}`);
+  printLine(`Namespace: ${record.namespace ?? "-"}`);
 }
 
 async function printPortTable(records: readonly (readonly [number, PortRecord])[]): Promise<void> {
@@ -357,6 +379,8 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
     records.map(async ([port, record]) => ({
       port: String(port),
       usedByProcess: (await isPortFree(port)) ? "no" : "yes",
+      tag: record.tag ?? "-",
+      namespace: record.namespace ?? "-",
       dir: record.dir,
       acquiredAt: record.acquired_at,
     })),
@@ -368,6 +392,8 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
       "USED_BY_PROCESS".length,
       ...rows.map((row) => row.usedByProcess.length),
     ),
+    tag: Math.max("TAG".length, ...rows.map((row) => row.tag.length)),
+    namespace: Math.max("NAMESPACE".length, ...rows.map((row) => row.namespace.length)),
     dir: Math.max("DIRECTORY".length, ...rows.map((row) => row.dir.length)),
     acquiredAt: Math.max("ACQUIRED_AT".length, ...rows.map((row) => row.acquiredAt.length)),
   };
@@ -376,6 +402,8 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
     [
       pad("PORT", widths.port),
       pad("USED_BY_PROCESS", widths.usedByProcess),
+      pad("TAG", widths.tag),
+      pad("NAMESPACE", widths.namespace),
       pad("DIRECTORY", widths.dir),
       pad("ACQUIRED_AT", widths.acquiredAt),
     ].join("  "),
@@ -386,6 +414,8 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
       [
         pad(row.port, widths.port),
         pad(row.usedByProcess, widths.usedByProcess),
+        pad(row.tag, widths.tag),
+        pad(row.namespace, widths.namespace),
         pad(row.dir, widths.dir),
         pad(row.acquiredAt, widths.acquiredAt),
       ].join("  "),
@@ -393,7 +423,26 @@ async function printPortTable(records: readonly (readonly [number, PortRecord])[
   }
 }
 
-async function acquirePorts(namedPorts: number[], count?: number): Promise<void> {
+function matchesMetadataFilter(
+  record: PortRecord,
+  metadata: { tag?: string; namespace?: string },
+): boolean {
+  if (metadata.tag !== undefined && record.tag !== metadata.tag) {
+    return false;
+  }
+
+  if (metadata.namespace !== undefined && record.namespace !== metadata.namespace) {
+    return false;
+  }
+
+  return true;
+}
+
+async function acquirePorts(
+  namedPorts: number[],
+  count: number | undefined,
+  metadata: { tag?: string; namespace?: string },
+): Promise<void> {
   ensureUniquePorts(namedPorts);
   const cwd = await getCurrentDir();
 
@@ -411,7 +460,7 @@ async function acquirePorts(namedPorts: number[], count?: number): Promise<void>
     }
 
     for (const port of ports) {
-      state.ports[String(port)] = buildRecord(cwd);
+      state.ports[String(port)] = buildRecord(cwd, metadata);
     }
 
     await writeState(state);
@@ -423,7 +472,10 @@ async function acquirePorts(namedPorts: number[], count?: number): Promise<void>
   }
 }
 
-async function releasePorts(requestedPorts: number[]): Promise<void> {
+async function releasePorts(
+  requestedPorts: number[],
+  metadata: { tag?: string; namespace?: string },
+): Promise<void> {
   ensureUniquePorts(requestedPorts);
   const cwd = await getCurrentDir();
 
@@ -435,7 +487,7 @@ async function releasePorts(requestedPorts: number[]): Promise<void> {
         ? requestedPorts
         : Object.entries(state.ports)
             .map(([port, record]) => [Number(port), record] as const)
-            .filter(([, record]) => record.dir === cwd)
+            .filter(([, record]) => record.dir === cwd && matchesMetadataFilter(record, metadata))
             .map(([port]) => port)
             .sort((left, right) => left - right);
 
@@ -460,7 +512,11 @@ async function releasePorts(requestedPorts: number[]): Promise<void> {
   }
 }
 
-async function showInfo(port: number | undefined, all: boolean): Promise<void> {
+async function showInfo(
+  port: number | undefined,
+  all: boolean,
+  metadata: { tag?: string; namespace?: string },
+): Promise<void> {
   const state = await withLock(async () => await readState());
 
   if (port !== undefined) {
@@ -471,7 +527,7 @@ async function showInfo(port: number | undefined, all: boolean): Promise<void> {
   const cwd = await getCurrentDir();
   const records = Object.entries(state.ports)
     .map(([port, record]) => [Number(port), record] as const)
-    .filter(([, record]) => all || record.dir === cwd)
+    .filter(([, record]) => (all || record.dir === cwd) && matchesMetadataFilter(record, metadata))
     .sort((left, right) => left[0] - right[0]);
 
   await printPortTable(records);
@@ -512,12 +568,20 @@ function createProgram(): Command {
     .description("Acquire ports and track them in bay's state file.")
     .argument("[ports...]", "specific ports to acquire")
     .option("-n, --count <count>", "acquire COUNT free ports", parseCount)
+    .option("--tag <tag>", "store a tag on the acquired ports", (value) =>
+      parseMetadataValue(value, "tag"),
+    )
+    .option("--namespace <namespace>", "store a namespace on the acquired ports", (value) =>
+      parseMetadataValue(value, "namespace"),
+    )
     .addHelpText(
       "after",
       commandNotes([
         "Examples:",
         "  bay acquire",
         "  bay acquire -n 5",
+        "  bay acquire --tag backend",
+        "  bay acquire --namespace sales-app",
         "  bay acquire 3000 3001 3002",
         "",
         "Notes:",
@@ -526,13 +590,16 @@ function createProgram(): Command {
         "  - requests are atomic: if one requested port fails, none are stored",
       ]),
     )
-    .action(async (ports: string[], options: { count?: number }) => {
+    .action(async (ports: string[], options: { count?: number; tag?: string; namespace?: string }) => {
       const namedPorts = ports.map(parsePort);
       if (options.count !== undefined && namedPorts.length > 0) {
         throw new CliError("cannot combine --count with named ports", 2);
       }
 
-      await acquirePorts(namedPorts, options.count);
+      await acquirePorts(namedPorts, options.count, {
+        tag: options.tag,
+        namespace: options.namespace,
+      });
     });
 
   program
@@ -566,12 +633,18 @@ function createProgram(): Command {
     .description("Show tracked metadata and current port status.")
     .argument("[port]", "specific port to inspect", parsePort)
     .option("--all", "show all tracked ports")
+    .option("--tag <tag>", "filter ports by tag", (value) => parseMetadataValue(value, "tag"))
+    .option("--namespace <namespace>", "filter ports by namespace", (value) =>
+      parseMetadataValue(value, "namespace"),
+    )
     .addHelpText(
       "after",
       commandNotes([
         "Examples:",
         "  bay info",
         "  bay info --all",
+        "  bay info --tag backend",
+        "  bay info --namespace sales-app",
         "  bay info 3000",
         "",
         "Notes:",
@@ -579,12 +652,18 @@ function createProgram(): Command {
         "  - tracked ports include a live free/in-use check",
       ]),
     )
-    .action(async (port: number | undefined, options: { all?: boolean }) => {
+    .action(async (port: number | undefined, options: { all?: boolean; tag?: string; namespace?: string }) => {
       if (port !== undefined && options.all) {
         throw new CliError("cannot combine --all with a specific port", 2);
       }
+      if (port !== undefined && (options.tag !== undefined || options.namespace !== undefined)) {
+        throw new CliError("cannot combine --tag/--namespace with a specific port", 2);
+      }
 
-      await showInfo(port, Boolean(options.all));
+      await showInfo(port, Boolean(options.all), {
+        tag: options.tag,
+        namespace: options.namespace,
+      });
     });
 
   program
@@ -592,11 +671,19 @@ function createProgram(): Command {
     .summary("Release tracked ports")
     .description("Release ports tracked by bay.")
     .argument("[ports...]", "specific ports to release")
+    .option("--tag <tag>", "release only ports with this tag", (value) =>
+      parseMetadataValue(value, "tag"),
+    )
+    .option("--namespace <namespace>", "release only ports with this namespace", (value) =>
+      parseMetadataValue(value, "namespace"),
+    )
     .addHelpText(
       "after",
       commandNotes([
         "Examples:",
         "  bay release",
+        "  bay release --tag backend",
+        "  bay release --namespace sales-app",
         "  bay release 3000 3001",
         "",
         "Notes:",
@@ -605,8 +692,15 @@ function createProgram(): Command {
         "  - named releases are atomic: if one port is missing, none are removed",
       ]),
     )
-    .action(async (ports: string[]) => {
-      await releasePorts(ports.map(parsePort));
+    .action(async (ports: string[], options: { tag?: string; namespace?: string }) => {
+      if (ports.length > 0 && (options.tag !== undefined || options.namespace !== undefined)) {
+        throw new CliError("cannot combine --tag/--namespace with explicit ports", 2);
+      }
+
+      await releasePorts(ports.map(parsePort), {
+        tag: options.tag,
+        namespace: options.namespace,
+      });
     });
 
   return program;
