@@ -680,7 +680,7 @@ async function acquirePorts(
   }
 }
 
-async function getPort(metadata: { tag?: string; namespace?: string }): Promise<void> {
+async function ensurePort(metadata: { tag?: string; namespace?: string }): Promise<void> {
   const cwd = await getCurrentDir();
 
   const port = await withLock(async () => {
@@ -849,7 +849,7 @@ function createProgram(): Command {
     });
 
   program
-    .command("get")
+    .command("ensure")
     .summary("Reuse a matching current-directory port or acquire one")
     .description(
       "Return an existing matching port acquired in the current directory, or acquire a new one if none exists.",
@@ -864,19 +864,19 @@ function createProgram(): Command {
       "after",
       commandNotes([
         "Examples:",
-        "  bay get",
-        "  bay get --tag backend",
-        "  bay get --tag backend --namespace sales-app",
+        "  bay ensure",
+        "  bay ensure --tag backend",
+        "  bay ensure --tag backend --namespace sales-app",
         "",
         "Notes:",
-        "  - get is always scoped to the current directory",
+        "  - ensure is always scoped to the current directory",
         "  - if one matching port already exists, bay prints it",
         "  - if none exist, bay acquires one and prints it",
         "  - if more than one match exists, bay errors instead of guessing",
       ]),
     )
     .action(async (options: { tag?: string; namespace?: string }) => {
-      await getPort({
+      await ensurePort({
         tag: options.tag,
         namespace: options.namespace,
       });

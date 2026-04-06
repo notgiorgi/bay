@@ -2,6 +2,17 @@
 
 `bay` is a Bun CLI for reserving local development ports and tracking who acquired them.
 
+## Direnv Example
+
+In `.envrc`, keep stable ports per directory and per role:
+
+```bash
+export PORT="$(bay ensure --tag backend)"
+export FE_PORT="$(bay ensure --tag front-end)"
+
+bay info
+```
+
 ## Acquiring Ports
 
 Acquire one port and store it in a shell variable:
@@ -33,8 +44,8 @@ bay check 3000
 Get a stable, directory-scoped port:
 
 ```bash
-PORT=$(bay get --tag backend)
-FE_PORT=$(bay get --tag front-end)
+PORT=$(bay ensure --tag backend)
+FE_PORT=$(bay ensure --tag front-end)
 ```
 
 ## Looking At Info
@@ -106,7 +117,7 @@ wget -qO- https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
 You can also pin a specific release or install directory:
 
 ```bash
-BAY_VERSION=v0.1.1 BAY_INSTALL_DIR=/usr/local/bin \
+BAY_VERSION=v0.1.2 BAY_INSTALL_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/notgiorgi/bay/main/install.sh | sh
 ```
 
@@ -154,7 +165,7 @@ bay acquire
 bay acquire -n 5
 bay acquire 3000 3001
 bay acquire --tag backend --namespace sales-app
-bay get --tag backend
+bay ensure --tag backend
 bay check 3000
 bay info 3000
 bay info
@@ -178,8 +189,8 @@ GitHub Actions is configured for:
 To cut a release:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 That workflow publishes GitHub release assets that are suitable for a later Homebrew formula.

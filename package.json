@@ -1,6 +1,6 @@
 {
   "name": "bay",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Track and reserve local development ports from a Bun CLI.",
   "module": "index.ts",
   "bin": {
